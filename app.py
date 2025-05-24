@@ -231,10 +231,4 @@ Important guidelines:
 
 # ===== SERVER LAUNCH =====
 if __name__ == "__main__":
-    nest_asyncio.apply()
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        timeout_keep_alive=300
-    ) 
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
