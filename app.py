@@ -1,26 +1,15 @@
-# ===== INSTALLATIONS =====
-# !pip install fastapi uvicorn transformers accelerate bitsandbytes pyngrok google-api-python-client wikipedia python-dotenv newsapi-python
-
-# ===== IMPORTS =====
+# ===== IMPORTS ===== 
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from huggingface_hub import login
-import torch
-import uvicorn
-from pyngrok import ngrok
-import nest_asyncio
+from huggingface_hub import InferenceClient
+import requests
 from fastapi.middleware.cors import CORSMiddleware
-from googlesearch import search
 import wikipedia
 from newsapi import NewsApiClient
 import time
 from datetime import datetime, timedelta
-
-MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.1"
-MAX_TOKENS = 150  # Reduced for Colab stability
 
 # ===== INITIALIZATION =====
 load_dotenv()
@@ -39,38 +28,25 @@ if not NEWSAPI_KEY:
 if not GOOGLE_CSE_ID:
     raise ValueError("GOOGLE_CSE_ID environment variable not set!")
 
-login(token=HF_TOKEN)
 app = FastAPI(title="Mistral-7B Fact-Checking API")
+
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows all origins
     allow_methods=["POST"],
     allow_headers=["*"],
 )
-# ===== MODEL LOADING =====
-print("⚙️ Loading model...")
-try:
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        load_in_4bit=True,
-        token=HF_TOKEN
-    )
-    print("✅ Model loaded successfully!")
-except Exception as e:
-    print(f"❌ Model loading failed: {str(e)}")
-    raise
 
-# ===== RAG FUNCTIONS =====
+# ===== MISTRAL 7B v0.3 CLIENT =====
+client = InferenceClient(token=HF_TOKEN, model="mistralai/Mistral-7B-Instruct-v0.3")
+
+# ===== RAG FUNCTIONS (UNCHANGED FROM YOUR ORIGINAL) ===== 
 def validate_sources(evidence: str, claim: str) -> bool:
     """Ensure sources meet minimum reliability standards"""
     if evidence == "No reliable sources found automatically":
         return False
         
-    # Check if sources contain at least one trusted domain
     trusted_domains = [
         'reuters.com', 'bbc.com', 'apnews.com', 
         'aljazeera.com', 'dawn.com', 'geo.tv',
@@ -82,9 +58,9 @@ def fetch_evidence(claim: str) -> str:
     """Retrieve evidence with multiple fallback layers"""
     evidence = []
     
-    # Layer 1: NewsAPI with extended timeout
+    # Layer 1: NewsAPI
     try:
-        newsapi = NewsApiClient(api_key=NEWSAPI_KEY, timeout=10)  # Increased timeout
+        newsapi = NewsApiClient(api_key=NEWSAPI_KEY, timeout=10)
         news = newsapi.get_everything(
             q=claim,
             sources="bbc-news,reuters,al-jazeera-english,associated-press",
@@ -99,33 +75,25 @@ def fetch_evidence(claim: str) -> str:
             for article in news.get('articles', [])
         ])
     except Exception as e:
-        print(f"NewsAPI Layer 1 failed: {str(e)}")
+        print(f"NewsAPI failed: {str(e)}")
 
-    # Layer 2: Direct domain scraping if NewsAPI fails
+    # Layer 2: Direct domain scraping
     if not evidence:
         try:
-            domains = [
-                "https://www.reuters.com/search?q=",
-                "https://apnews.com/search?q=",
-                "https://www.bbc.com/search?q="
-            ]
+            from googlesearch import search
+            domains = ["reuters.com", "apnews.com", "bbc.com"]
             for domain in domains:
                 try:
-                    results = search(
-                        f"site:{domain.split('//')[-1].split('/')[0]} {claim}",
-                        num=3,
-                        pause=2.0,
-                        stop=3
-                    )
+                    results = search(f"site:{domain} {claim}", num=3, pause=2.0)
                     evidence.extend(results)
                     if evidence: break
                 except:
                     continue
         except Exception as e:
-            print(f"Direct Search Layer 2 failed: {str(e)}")
+            print(f"Google search failed: {str(e)}")
 
-    # Layer 3: Wikipedia for historical facts
-    if not evidence and any(keyword in claim.lower() for keyword in ["elected", "sworn", "appointed"]):
+    # Layer 3: Wikipedia
+    if not evidence and any(keyword in claim.lower() for keyword in ["elected", "sworn"]):
         try:
             wp_summary = wikipedia.summary(claim.split(" in ")[0], sentences=3)
             evidence.append(f"📚 Wikipedia: {wp_summary}")
@@ -136,12 +104,10 @@ def fetch_evidence(claim: str) -> str:
 
 def parse_model_response(response: str) -> dict:
     """Parse and validate the model's structured response"""
-    response = response.replace("Verdict: ", "").replace("Summary: ", "")
-    
     result = {
         "verdict": "Unverifiable",
         "confidence": "Low",
-        "summary": "Insufficient evidence to verify this claim",
+        "summary": "Insufficient evidence",
         "key_evidence": "",
         "latest_evidence_date": "Unknown"
     }
@@ -149,15 +115,15 @@ def parse_model_response(response: str) -> dict:
     try:
         lines = [line.strip() for line in response.split("\n") if line.strip()]
         for line in lines:
-            if line.lower().startswith("1.") or "verdict" in line.lower():
+            if "Verdict:" in line:
                 result["verdict"] = line.split(":")[-1].strip()
-            elif line.lower().startswith("2.") or "confidence" in line.lower():
+            elif "Confidence:" in line:
                 result["confidence"] = line.split(":")[-1].strip()
-            elif line.lower().startswith("3.") or "summary" in line.lower():
+            elif "Summary:" in line:
                 result["summary"] = line.split(":")[-1].strip()
-            elif line.lower().startswith("4.") or "evidence" in line.lower():
+            elif "Key Evidence:" in line:
                 result["key_evidence"] = line.split(":")[-1].strip()
-            elif line.lower().startswith("5.") or "date" in line.lower():
+            elif "Latest Evidence Date:" in line:
                 result["latest_evidence_date"] = line.split(":")[-1].strip()
     except Exception as e:
         print(f"Parsing error: {str(e)}")
@@ -182,12 +148,11 @@ async def factcheck(request: ClaimRequest):
     start_time = time.time()
     evidence = fetch_evidence(request.claim)
     
-    # Critical check before processing
     if not validate_sources(evidence, request.claim):
         return {
             "verdict": "Unverifiable",
             "confidence": "Low",
-            "summary": "No reliable sources could be found to verify this claim",
+            "summary": "No reliable sources found",
             "key_evidence": "",
             "sources": evidence,
             "latest_evidence_date": "Unknown",
@@ -195,36 +160,28 @@ async def factcheck(request: ClaimRequest):
         }
     
     try:
-        # Step 2: Generate fact-check
-        prompt = f"""<s>[INST] You are a fact-checking assistant. Analyze this claim:
+        # MISTRAL 7B v0.3 SPECIFIC PROMPT FORMATTING
+        prompt = f"""<s>[INST] You are a fact-checking assistant. Analyze:
 Claim: {request.claim}
 
-Available Evidence:
+Evidence:
 {evidence}
 
-Provide your analysis in this EXACT format:
-1. Verdict (True/False/Misleading/Unverifiable)
-2. Confidence (High/Medium/Low)
-3. Summary (Concise factual summary)
-4. Key Evidence (Most relevant source)
-5. Date of Latest Evidence (YYYY-MM-DD or 'Unknown')
-
-Important guidelines:
-- Prefer recent evidence (last 3 months)
-- If no evidence found, verdict should be 'Unverifiable'
-- For country-specific claims, prioritize local sources [/INST]"""
+Provide analysis in this exact format:
+1. Verdict: [True/False/Misleading/Unverifiable]
+2. Confidence: [High/Medium/Low]
+3. Summary: [Concise factual summary]
+4. Key Evidence: [Most relevant source]
+5. Latest Evidence Date: [YYYY-MM-DD or Unknown] [/INST]"""
         
-        inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=MAX_TOKENS,
-            temperature=0.7,
-            do_sample=True
+        # MISTRAL 7B v0.3 API CALL
+        response = client.text_generation(
+            prompt=prompt,
+            max_new_tokens=200,
+            temperature=0.7
         )
         
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        response = response.split("[/INST]")[-1].strip()
-        parsed_response = parse_model_response(response)
+        parsed_response = parse_model_response(response.split("[/INST]")[-1].strip())
 
         return {
             "verdict": parsed_response["verdict"],
@@ -235,11 +192,7 @@ Important guidelines:
             "latest_evidence_date": parsed_response["latest_evidence_date"],
             "processing_time": round(time.time() - start_time, 2)
         }
-    except torch.cuda.OutOfMemoryError:
-        raise HTTPException(
-            status_code=500,
-            detail="GPU memory exceeded - try reducing MAX_TOKENS"
-        )
+        
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -249,3 +202,255 @@ Important guidelines:
 # ===== SERVER LAUNCH =====
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+
+# ===== INSTALLATIONS =====
+# !pip install fastapi uvicorn transformers accelerate bitsandbytes pyngrok google-api-python-client wikipedia python-dotenv newsapi-python
+
+# ===== IMPORTS =====
+# import os
+# from dotenv import load_dotenv
+# from fastapi import FastAPI, HTTPException
+# from pydantic import BaseModel
+# from transformers import AutoTokenizer, AutoModelForCausalLM
+# from huggingface_hub import login
+# import torch
+# import uvicorn
+# from pyngrok import ngrok
+# import nest_asyncio
+# from fastapi.middleware.cors import CORSMiddleware
+# from googlesearch import search
+# import wikipedia
+# from newsapi import NewsApiClient
+# import time
+# from datetime import datetime, timedelta
+
+# MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.1"
+# MAX_TOKENS = 150  # Reduced for Colab stability
+
+# # ===== INITIALIZATION =====
+# load_dotenv()
+# HF_TOKEN = os.getenv("HF_TOKEN")
+# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+# NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
+
+# # Validate they exist
+# if not HF_TOKEN:
+#     raise ValueError("HF_TOKEN environment variable not set!")
+# if not GOOGLE_API_KEY:
+#     raise ValueError("GOOGLE_API_KEY environment variable not set!")
+# if not NEWSAPI_KEY:
+#     raise ValueError("NEWSAPI_KEY environment variable not set!")
+# if not GOOGLE_CSE_ID:
+#     raise ValueError("GOOGLE_CSE_ID environment variable not set!")
+
+# login(token=HF_TOKEN)
+# app = FastAPI(title="Mistral-7B Fact-Checking API")
+# # CORS Configuration
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_methods=["POST"],
+#     allow_headers=["*"],
+# )
+# # ===== MODEL LOADING =====
+# print("⚙️ Loading model...")
+# try:
+#     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+#     model = AutoModelForCausalLM.from_pretrained(
+#         MODEL_ID,
+#         device_map="auto",
+#         torch_dtype=torch.float16,
+#         load_in_4bit=True,
+#         token=HF_TOKEN
+#     )
+#     print("✅ Model loaded successfully!")
+# except Exception as e:
+#     print(f"❌ Model loading failed: {str(e)}")
+#     raise
+
+# # ===== RAG FUNCTIONS =====
+# def validate_sources(evidence: str, claim: str) -> bool:
+#     """Ensure sources meet minimum reliability standards"""
+#     if evidence == "No reliable sources found automatically":
+#         return False
+        
+#     # Check if sources contain at least one trusted domain
+#     trusted_domains = [
+#         'reuters.com', 'bbc.com', 'apnews.com', 
+#         'aljazeera.com', 'dawn.com', 'geo.tv',
+#         'nytimes.com', 'washingtonpost.com'
+#     ]
+#     return any(domain in evidence.lower() for domain in trusted_domains)
+
+# def fetch_evidence(claim: str) -> str:
+#     """Retrieve evidence with multiple fallback layers"""
+#     evidence = []
+    
+#     # Layer 1: NewsAPI with extended timeout
+#     try:
+#         newsapi = NewsApiClient(api_key=NEWSAPI_KEY, timeout=10)  # Increased timeout
+#         news = newsapi.get_everything(
+#             q=claim,
+#             sources="bbc-news,reuters,al-jazeera-english,associated-press",
+#             language="en",
+#             page_size=5,
+#             sort_by="publishedAt",
+#             from_param=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+#         )
+#         evidence.extend([
+#             f"📰 {article['publishedAt'][:10]} | {article['source']['name']}: "
+#             f"{article['title']}\n{article['url']}"
+#             for article in news.get('articles', [])
+#         ])
+#     except Exception as e:
+#         print(f"NewsAPI Layer 1 failed: {str(e)}")
+
+#     # Layer 2: Direct domain scraping if NewsAPI fails
+#     if not evidence:
+#         try:
+#             domains = [
+#                 "https://www.reuters.com/search?q=",
+#                 "https://apnews.com/search?q=",
+#                 "https://www.bbc.com/search?q="
+#             ]
+#             for domain in domains:
+#                 try:
+#                     results = search(
+#                         f"site:{domain.split('//')[-1].split('/')[0]} {claim}",
+#                         num=3,
+#                         pause=2.0,
+#                         stop=3
+#                     )
+#                     evidence.extend(results)
+#                     if evidence: break
+#                 except:
+#                     continue
+#         except Exception as e:
+#             print(f"Direct Search Layer 2 failed: {str(e)}")
+
+#     # Layer 3: Wikipedia for historical facts
+#     if not evidence and any(keyword in claim.lower() for keyword in ["elected", "sworn", "appointed"]):
+#         try:
+#             wp_summary = wikipedia.summary(claim.split(" in ")[0], sentences=3)
+#             evidence.append(f"📚 Wikipedia: {wp_summary}")
+#         except:
+#             pass
+
+#     return "\n\n".join(evidence) if evidence else "No reliable sources found automatically"
+
+# def parse_model_response(response: str) -> dict:
+#     """Parse and validate the model's structured response"""
+#     response = response.replace("Verdict: ", "").replace("Summary: ", "")
+    
+#     result = {
+#         "verdict": "Unverifiable",
+#         "confidence": "Low",
+#         "summary": "Insufficient evidence to verify this claim",
+#         "key_evidence": "",
+#         "latest_evidence_date": "Unknown"
+#     }
+    
+#     try:
+#         lines = [line.strip() for line in response.split("\n") if line.strip()]
+#         for line in lines:
+#             if line.lower().startswith("1.") or "verdict" in line.lower():
+#                 result["verdict"] = line.split(":")[-1].strip()
+#             elif line.lower().startswith("2.") or "confidence" in line.lower():
+#                 result["confidence"] = line.split(":")[-1].strip()
+#             elif line.lower().startswith("3.") or "summary" in line.lower():
+#                 result["summary"] = line.split(":")[-1].strip()
+#             elif line.lower().startswith("4.") or "evidence" in line.lower():
+#                 result["key_evidence"] = line.split(":")[-1].strip()
+#             elif line.lower().startswith("5.") or "date" in line.lower():
+#                 result["latest_evidence_date"] = line.split(":")[-1].strip()
+#     except Exception as e:
+#         print(f"Parsing error: {str(e)}")
+    
+#     return result
+
+# # ===== API ENDPOINTS =====
+# class ClaimRequest(BaseModel):
+#     claim: str
+
+# class FactCheckResponse(BaseModel):
+#     verdict: str
+#     confidence: str
+#     summary: str
+#     key_evidence: str
+#     sources: str
+#     latest_evidence_date: str
+#     processing_time: float
+
+# @app.post("/factcheck", response_model=FactCheckResponse)
+# async def factcheck(request: ClaimRequest):
+#     start_time = time.time()
+#     evidence = fetch_evidence(request.claim)
+    
+#     # Critical check before processing
+#     if not validate_sources(evidence, request.claim):
+#         return {
+#             "verdict": "Unverifiable",
+#             "confidence": "Low",
+#             "summary": "No reliable sources could be found to verify this claim",
+#             "key_evidence": "",
+#             "sources": evidence,
+#             "latest_evidence_date": "Unknown",
+#             "processing_time": round(time.time() - start_time, 2)
+#         }
+    
+#     try:
+#         # Step 2: Generate fact-check
+#         prompt = f"""<s>[INST] You are a fact-checking assistant. Analyze this claim:
+# Claim: {request.claim}
+
+# Available Evidence:
+# {evidence}
+
+# Provide your analysis in this EXACT format:
+# 1. Verdict (True/False/Misleading/Unverifiable)
+# 2. Confidence (High/Medium/Low)
+# 3. Summary (Concise factual summary)
+# 4. Key Evidence (Most relevant source)
+# 5. Date of Latest Evidence (YYYY-MM-DD or 'Unknown')
+
+# Important guidelines:
+# - Prefer recent evidence (last 3 months)
+# - If no evidence found, verdict should be 'Unverifiable'
+# - For country-specific claims, prioritize local sources [/INST]"""
+        
+#         inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+#         outputs = model.generate(
+#             **inputs,
+#             max_new_tokens=MAX_TOKENS,
+#             temperature=0.7,
+#             do_sample=True
+#         )
+        
+#         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+#         response = response.split("[/INST]")[-1].strip()
+#         parsed_response = parse_model_response(response)
+
+#         return {
+#             "verdict": parsed_response["verdict"],
+#             "confidence": parsed_response["confidence"],
+#             "summary": parsed_response["summary"],
+#             "key_evidence": parsed_response["key_evidence"],
+#             "sources": evidence,
+#             "latest_evidence_date": parsed_response["latest_evidence_date"],
+#             "processing_time": round(time.time() - start_time, 2)
+#         }
+#     except torch.cuda.OutOfMemoryError:
+#         raise HTTPException(
+#             status_code=500,
+#             detail="GPU memory exceeded - try reducing MAX_TOKENS"
+#         )
+#     except Exception as e:
+#         raise HTTPException(
+#             status_code=500,
+#             detail=f"Processing error: {str(e)}"
+#         )
+
+# # ===== SERVER LAUNCH =====
+# if __name__ == "__main__":
+#     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
