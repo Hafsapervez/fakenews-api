@@ -1,4 +1,4 @@
-import os 
+import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -24,11 +24,11 @@ app.add_middleware(
 )
 
 # ===== SERVICES SETUP =====
-HF_TOKEN = os.getenv("HF_TOKEN")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")  # Correctly loaded from environment
+HF_TOKEN = "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"
+NEWSAPI_KEY = "pub_e8e1562f03404268bd119c4044b9ea2d"
 
 if not HF_TOKEN or not NEWSAPI_KEY:
-    raise ValueError("Missing required environment variables: HF_TOKEN or NEWSAPI_KEY")
+    raise ValueError("Missing required environment variables")
 
 client = InferenceClient(token=HF_TOKEN, model="mistralai/Mistral-7B-Instruct-v0.3")
 newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
@@ -37,7 +37,7 @@ newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
 def fetch_evidence(claim: str) -> str:
     """Enhanced evidence gathering with multiple fallbacks"""
     evidence = []
-
+    
     # 1. NewsAPI (Primary Source)
     try:
         news = newsapi.get_everything(
@@ -52,22 +52,22 @@ def fetch_evidence(claim: str) -> str:
             f"{article['title']}\n{article['url']}"
             for article in news.get('articles', [])
             if any(d in article['url'].lower() 
-                   for d in ['reuters', 'bbc', 'apnews', 'aljazeera'])
+                  for d in ['reuters', 'bbc', 'apnews', 'aljazeera', 'cnn'])
         ])
     except Exception as e:
         print(f"NewsAPI Error: {str(e)}")
 
     # 2. Google Search (Fallback)
-    if len(evidence) < 3:
+    if len(evidence) < 3:  # If less than 3 articles found
         try:
             domains = ["reuters.com", "apnews.com", "bbc.com", "aljazeera.com", "cnn.com"]
             query = f'"{claim}" {" OR ".join(f"site:{d}" for d in domains)}'
             results = list(search(query, num=5, stop=5, pause=2.0))
-            evidence.extend(results[:3])
+            evidence.extend(results[:3])  # Add top 3 results
         except Exception as e:
             print(f"Google Search Error: {str(e)}")
 
-    # 3. Wikipedia (For Historical/Political Claims)
+    # 3. Wikipedia (For Historical Facts)
     if not evidence and any(kw in claim.lower() for kw in ["elected", "sworn", "appointed"]):
         try:
             wp_summary = wikipedia.summary(claim.split(" in ")[0], sentences=3)
@@ -75,13 +75,23 @@ def fetch_evidence(claim: str) -> str:
         except:
             pass
 
-    return "\n\n".join(evidence) if evidence else ""
+    return "\n\n".join(evidence) if evidence else "No reliable sources found"
 
 # ===== MODEL PROCESSING =====
 def generate_verdict(claim: str, evidence: str) -> dict:
-    """Return model analysis with or without RAG"""
-    if evidence:
-        # Use RAG
+    """Get model analysis with proper prompt engineering"""
+    if evidence == "No reliable sources found":
+        # Special handling when no evidence is found
+        prompt = f"""<s>[INST] You are a professional fact-checker. Analyze the following claim without external evidence:
+Claim: {claim}
+
+Provide structured response:
+1. Verdict: [True/False/Misleading/Unverifiable]
+2. Confidence: [High/Medium/Low]
+3. Summary: [Concise analysis based on your knowledge]
+4. Key Evidence: [None]
+5. Latest Date: [Unknown] [/INST]"""
+    else:
         prompt = f"""<s>[INST] You are a professional fact-checker. Analyze:
 Claim: {claim}
 
@@ -94,50 +104,35 @@ Provide structured response:
 3. Summary: [Concise analysis]
 4. Key Evidence: [Most relevant source]
 5. Latest Date: [YYYY-MM-DD or Unknown] [/INST]"""
-    else:
-        # Use only LLM generation with no evidence (when nothing verifiable is found)
-        prompt = f"""<s>[INST] You are a professional fact-checker. A user submitted the following claim:
-Claim: {claim}
-
-There are no reliable or verifiable sources found in news or search engines.
-
-Please analyze the statement based on your general world knowledge and common-sense reasoning.
-
-Provide structured response:
-1. Verdict: [True/False/Misleading/Unverifiable]
-2. Confidence: [High/Medium/Low]
-3. Summary: [Concise explanation of why]
-4. Key Evidence: [LLM-based reasoning]
-5. Latest Date: [Unknown or N/A] [/INST]"""
 
     response = client.text_generation(
         prompt=prompt,
         max_new_tokens=250,
         temperature=0.7
     )
-
+    
     # Parse the response
     lines = [l.strip() for l in response.split('\n') if l.strip()]
     result = {
-        "verdict": "False",
+        "verdict": "Unverifiable",
         "confidence": "Low",
-        "summary": "Insufficient evidence",
+        "summary": "Insufficient evidence to verify the claim",
         "key_evidence": "",
         "latest_date": "Unknown"
     }
-
+    
     for line in lines:
         if "Verdict:" in line:
-            result["verdict"] = line.split(":", 1)[1].strip()
+            result["verdict"] = line.split(":")[1].strip()
         elif "Confidence:" in line:
-            result["confidence"] = line.split(":", 1)[1].strip()
+            result["confidence"] = line.split(":")[1].strip()
         elif "Summary:" in line:
-            result["summary"] = line.split(":", 1)[1].strip()
+            result["summary"] = line.split(":")[1].strip()
         elif "Key Evidence:" in line:
-            result["key_evidence"] = line.split(":", 1)[1].strip()
+            result["key_evidence"] = line.split(":")[1].strip()
         elif "Latest Date:" in line:
-            result["latest_date"] = line.split(":", 1)[1].strip()
-
+            result["latest_date"] = line.split(":")[1].strip()
+    
     return result
 
 # ===== API ENDPOINTS =====
@@ -156,29 +151,26 @@ class FactCheckResponse(BaseModel):
 @app.post("/factcheck", response_model=FactCheckResponse)
 async def factcheck(request: ClaimRequest):
     start_time = time.time()
-
+    
     try:
         # Step 1: Gather Evidence
         evidence = fetch_evidence(request.claim)
-
+        
         # Step 2: Generate Verdict
         analysis = generate_verdict(request.claim, evidence)
-
+        
         return {
             "verdict": analysis["verdict"],
             "confidence": analysis["confidence"],
             "summary": analysis["summary"],
             "key_evidence": analysis["key_evidence"],
-            "sources": evidence or "No reliable sources found.",
+            "sources": evidence,
             "latest_evidence_date": analysis["latest_date"],
             "processing_time": round(time.time() - start_time, 2)
         }
-
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Fact-checking failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
