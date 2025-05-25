@@ -18,10 +18,27 @@ import wikipedia
 from newsapi import NewsApiClient
 import time
 from datetime import datetime, timedelta
+
 MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.1"
 MAX_TOKENS = 150  # Reduced for Colab stability
 
 # ===== INITIALIZATION =====
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_CSE_ID= os.getenv("GOOGLE_CSE_ID")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY ")
+
+# Validate they exist
+if not HF_TOKEN:
+    raise ValueError("HF_TOKEN environment variable not set!")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable not set!")
+if not NEWSAPI_KEY:
+    raise ValueError("NEWSAPI_KEY environment variable not set!")
+if not GOOGLE_CSE_ID:
+    raise ValueError("GOOGLE_CSE_ID environment variable not set!")
+
 login(token=HF_TOKEN)
 app = FastAPI(title="Mistral-7B Fact-Checking API")
 # CORS Configuration
