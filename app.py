@@ -4,129 +4,123 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from huggingface_hub import InferenceClient
-import requests
-from fastapi.middleware.cors import CORSMiddleware
-import wikipedia
 from newsapi import NewsApiClient
+from googlesearch import search
+import wikipedia
 import time
 from datetime import datetime, timedelta
+from fastapi.middleware.cors import CORSMiddleware
 
 # ===== INITIALIZATION =====
 load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
-
-# Validate they exist
-if not HF_TOKEN:
-    raise ValueError("HF_TOKEN environment variable not set!")
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable not set!")
-if not NEWSAPI_KEY:
-    raise ValueError("NEWSAPI_KEY environment variable not set!")
-if not GOOGLE_CSE_ID:
-    raise ValueError("GOOGLE_CSE_ID environment variable not set!")
 
 app = FastAPI(title="Mistral-7B Fact-Checking API")
 
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_methods=["POST"],
     allow_headers=["*"],
 )
 
-# ===== MISTRAL 7B v0.3 CLIENT =====
+# ===== SERVICES SETUP =====
+HF_TOKEN = os.getenv("HF_TOKEN")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
+
+if not HF_TOKEN or not NEWSAPI_KEY:
+    raise ValueError("Missing required environment variables")
+
 client = InferenceClient(token=HF_TOKEN, model="mistralai/Mistral-7B-Instruct-v0.3")
+newsapi = NewsApiClient(api_key=NEWSAPI_KEY, timeout=15)
 
-# ===== RAG FUNCTIONS (UNCHANGED FROM YOUR ORIGINAL) ===== 
-def validate_sources(evidence: str, claim: str) -> bool:
-    """Ensure sources meet minimum reliability standards"""
-    if evidence == "No reliable sources found automatically":
-        return False
-        
-    trusted_domains = [
-        'reuters.com', 'bbc.com', 'apnews.com', 
-        'aljazeera.com', 'dawn.com', 'geo.tv',
-        'nytimes.com', 'washingtonpost.com'
-    ]
-    return any(domain in evidence.lower() for domain in trusted_domains)
-
+# ===== EVIDENCE GATHERING =====
 def fetch_evidence(claim: str) -> str:
-    """Retrieve evidence with multiple fallback layers"""
+    """Enhanced evidence gathering with multiple fallbacks"""
     evidence = []
     
-    # Layer 1: NewsAPI
+    # 1. NewsAPI (Primary Source)
     try:
-        newsapi = NewsApiClient(api_key=NEWSAPI_KEY, timeout=10)
         news = newsapi.get_everything(
-            q=claim,
-            sources="bbc-news,reuters,al-jazeera-english,associated-press",
+            q=f'"{claim}"',
             language="en",
             page_size=5,
             sort_by="publishedAt",
-            from_param=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            from_param=(datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
         )
         evidence.extend([
             f"📰 {article['publishedAt'][:10]} | {article['source']['name']}: "
             f"{article['title']}\n{article['url']}"
             for article in news.get('articles', [])
+            if any(d in article['url'].lower() 
+                for d in ['reuters', 'bbc', 'apnews', 'aljazeera'])
         ])
     except Exception as e:
-        print(f"NewsAPI failed: {str(e)}")
+        print(f"NewsAPI Error: {str(e)}")
 
-    # Layer 2: Direct domain scraping
-    if not evidence:
+    # 2. Google Search (Fallback)
+    if len(evidence) < 3:  # If less than 3 articles found
         try:
-            from googlesearch import search
-            domains = ["reuters.com", "apnews.com", "bbc.com"]
-            for domain in domains:
-                try:
-                    results = search(f"site:{domain} {claim}", num=3, pause=2.0)
-                    evidence.extend(results)
-                    if evidence: break
-                except:
-                    continue
+            domains = ["reuters.com", "apnews.com", "bbc.com", "aljazeera.com"]
+            query = f'"{claim}" {" OR ".join(f"site:{d}" for d in domains)}'
+            results = list(search(query, num=5, stop=5, pause=2.0))
+            evidence.extend(results[:3])  # Add top 3 results
         except Exception as e:
-            print(f"Google search failed: {str(e)}")
+            print(f"Google Search Error: {str(e)}")
 
-    # Layer 3: Wikipedia
-    if not evidence and any(keyword in claim.lower() for keyword in ["elected", "sworn"]):
+    # 3. Wikipedia (For Historical Facts)
+    if not evidence and any(kw in claim.lower() for kw in ["elected", "sworn", "appointed"]):
         try:
             wp_summary = wikipedia.summary(claim.split(" in ")[0], sentences=3)
             evidence.append(f"📚 Wikipedia: {wp_summary}")
         except:
             pass
 
-    return "\n\n".join(evidence) if evidence else "No reliable sources found automatically"
+    return "\n\n".join(evidence) if evidence else "No reliable sources found"
 
-def parse_model_response(response: str) -> dict:
-    """Parse and validate the model's structured response"""
+# ===== MODEL PROCESSING =====
+def generate_verdict(claim: str, evidence: str) -> dict:
+    """Get model analysis with proper prompt engineering"""
+    prompt = f"""<s>[INST] You are a professional fact-checker. Analyze:
+Claim: {claim}
+
+Evidence:
+{evidence}
+
+Provide structured response:
+1. Verdict: [True/False/Misleading/Unverifiable]
+2. Confidence: [High/Medium/Low]
+3. Summary: [Concise analysis]
+4. Key Evidence: [Most relevant source]
+5. Latest Date: [YYYY-MM-DD or Unknown] [/INST]"""
+
+    response = client.text_generation(
+        prompt=prompt,
+        max_new_tokens=250,
+        temperature=0.7
+    )
+    
+    # Parse the response
+    lines = [l.strip() for l in response.split('\n') if l.strip()]
     result = {
         "verdict": "Unverifiable",
         "confidence": "Low",
         "summary": "Insufficient evidence",
         "key_evidence": "",
-        "latest_evidence_date": "Unknown"
+        "latest_date": "Unknown"
     }
     
-    try:
-        lines = [line.strip() for line in response.split("\n") if line.strip()]
-        for line in lines:
-            if "Verdict:" in line:
-                result["verdict"] = line.split(":")[-1].strip()
-            elif "Confidence:" in line:
-                result["confidence"] = line.split(":")[-1].strip()
-            elif "Summary:" in line:
-                result["summary"] = line.split(":")[-1].strip()
-            elif "Key Evidence:" in line:
-                result["key_evidence"] = line.split(":")[-1].strip()
-            elif "Latest Evidence Date:" in line:
-                result["latest_evidence_date"] = line.split(":")[-1].strip()
-    except Exception as e:
-        print(f"Parsing error: {str(e)}")
+    for line in lines:
+        if "Verdict:" in line:
+            result["verdict"] = line.split(":")[1].strip()
+        elif "Confidence:" in line:
+            result["confidence"] = line.split(":")[1].strip()
+        elif "Summary:" in line:
+            result["summary"] = line.split(":")[1].strip()
+        elif "Key Evidence:" in line:
+            result["key_evidence"] = line.split(":")[1].strip()
+        elif "Latest Date:" in line:
+            result["latest_date"] = line.split(":")[1].strip()
     
     return result
 
@@ -146,62 +140,33 @@ class FactCheckResponse(BaseModel):
 @app.post("/factcheck", response_model=FactCheckResponse)
 async def factcheck(request: ClaimRequest):
     start_time = time.time()
-    evidence = fetch_evidence(request.claim)
-    
-    if not validate_sources(evidence, request.claim):
-        return {
-            "verdict": "Unverifiable",
-            "confidence": "Low",
-            "summary": "No reliable sources found",
-            "key_evidence": "",
-            "sources": evidence,
-            "latest_evidence_date": "Unknown",
-            "processing_time": round(time.time() - start_time, 2)
-        }
     
     try:
-        # MISTRAL 7B v0.3 SPECIFIC PROMPT FORMATTING
-        prompt = f"""<s>[INST] You are a fact-checking assistant. Analyze:
-Claim: {request.claim}
-
-Evidence:
-{evidence}
-
-Provide analysis in this exact format:
-1. Verdict: [True/False/Misleading/Unverifiable]
-2. Confidence: [High/Medium/Low]
-3. Summary: [Concise factual summary]
-4. Key Evidence: [Most relevant source]
-5. Latest Evidence Date: [YYYY-MM-DD or Unknown] [/INST]"""
+        # Step 1: Gather Evidence
+        evidence = fetch_evidence(request.claim)
         
-        # MISTRAL 7B v0.3 API CALL
-        response = client.text_generation(
-            prompt=prompt,
-            max_new_tokens=200,
-            temperature=0.7
-        )
+        # Step 2: Generate Verdict
+        analysis = generate_verdict(request.claim, evidence)
         
-        parsed_response = parse_model_response(response.split("[/INST]")[-1].strip())
-
         return {
-            "verdict": parsed_response["verdict"],
-            "confidence": parsed_response["confidence"],
-            "summary": parsed_response["summary"],
-            "key_evidence": parsed_response["key_evidence"],
+            "verdict": analysis["verdict"],
+            "confidence": analysis["confidence"],
+            "summary": analysis["summary"],
+            "key_evidence": analysis["key_evidence"],
             "sources": evidence,
-            "latest_evidence_date": parsed_response["latest_evidence_date"],
+            "latest_evidence_date": analysis["latest_date"],
             "processing_time": round(time.time() - start_time, 2)
         }
         
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Processing error: {str(e)}"
+            detail=f"Fact-checking failed: {str(e)}"
         )
 
-# ===== SERVER LAUNCH =====
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 # ===== INSTALLATIONS =====
 # !pip install fastapi uvicorn transformers accelerate bitsandbytes pyngrok google-api-python-client wikipedia python-dotenv newsapi-python
