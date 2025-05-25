@@ -9,6 +9,7 @@ import wikipedia
 import time
 from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
+import requests
 
 # ===== INITIALIZATION =====
 load_dotenv()
@@ -27,55 +28,91 @@ app.add_middleware(
 HF_TOKEN = "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"
 NEWSAPI_KEY = "pub_e8e1562f03404268bd119c4044b9ea2d"
 
-if not HF_TOKEN or not NEWSAPI_KEY:
-    raise ValueError("Missing required environment variables")
-
 client = InferenceClient(token=HF_TOKEN, model="mistralai/Mistral-7B-Instruct-v0.3")
 newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
 
-# ===== EVIDENCE GATHERING =====
+# ===== EVIDENCE GATHERING ====
+def validate_sources(evidence: str, claim: str) -> bool:
+    """Ensure sources meet minimum reliability standards"""
+    if evidence == "No reliable sources found automatically":
+        return False
+
+    trusted_domains = [
+        'reuters.com', 'bbc.com', 'apnews.com', 
+        'aljazeera.com', 'dawn.com', 'geo.tv',
+        'nytimes.com', 'washingtonpost.com'
+    ]
+    return any(domain in evidence.lower() for domain in trusted_domains)
+
+
 def fetch_evidence(claim: str) -> str:
-    """Enhanced evidence gathering with multiple fallbacks"""
+    """Retrieve evidence with multiple fallback layers"""
+    import requests
+    from googlesearch import search
+    import wikipedia
+
     evidence = []
-    
-    # 1. NewsAPI (Primary Source)
+
+    # Layer 1: NewsData.io API (Primary Source)
     try:
-        news = newsapi.get_everything(
-            q=f'"{claim}"',
-            language="en",
-            page_size=5,
-            sort_by="publishedAt",
-            from_param=(datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+        NEWSAPI_KEY = "pub_e8e1562f03404268bd119c4044b9ea2d"
+        response = requests.get(
+            "https://newsdata.io/api/1/news",
+            params={
+                "apikey": NEWSAPI_KEY,
+                "q": claim,
+                "language": "en",
+                "size": 5,
+            }
         )
+        response.raise_for_status()
+        news = response.json()
+
         evidence.extend([
-            f"📰 {article['publishedAt'][:10]} | {article['source']['name']}: "
-            f"{article['title']}\n{article['url']}"
-            for article in news.get('articles', [])
-            if any(d in article['url'].lower() 
-                  for d in ['reuters', 'bbc', 'apnews', 'aljazeera', 'cnn'])
+            f"📰 {article.get('pubDate', 'Unknown')[:10]} | {article.get('source_id', 'Unknown')}: "
+            f"{article.get('title', 'No title')}\n{article.get('link', 'No URL')}"
+            for article in news.get("results", [])
+            if any(d in article.get("link", "").lower() 
+                   for d in ['reuters', 'bbc', 'apnews', 'aljazeera', 'cnn'])
         ])
     except Exception as e:
-        print(f"NewsAPI Error: {str(e)}")
+        print(f"NewsData.io Error: {str(e)}")
 
-    # 2. Google Search (Fallback)
-    if len(evidence) < 3:  # If less than 3 articles found
+    # Layer 2: Google Search fallback
+    if not evidence:
         try:
-            domains = ["reuters.com", "apnews.com", "bbc.com", "aljazeera.com", "cnn.com"]
-            query = f'"{claim}" {" OR ".join(f"site:{d}" for d in domains)}'
-            results = list(search(query, num=5, stop=5, pause=2.0))
-            evidence.extend(results[:3])  # Add top 3 results
+            domains = [
+                "https://www.reuters.com/search?q=",
+                "https://apnews.com/search?q=",
+                "https://www.bbc.com/search?q="
+            ]
+            for domain in domains:
+                try:
+                    results = search(
+                        f"site:{domain.split('//')[-1].split('/')[0]} {claim}",
+                        num=3,
+                        pause=2.0,
+                        stop=3
+                    )
+                    evidence.extend(results)
+                    if evidence:
+                        break
+                except Exception as search_err:
+                    print(f"Search error on {domain}: {search_err}")
         except Exception as e:
-            print(f"Google Search Error: {str(e)}")
+            print(f"Direct Search Layer 2 failed: {str(e)}")
 
-    # 3. Wikipedia (For Historical Facts)
-    if not evidence and any(kw in claim.lower() for kw in ["elected", "sworn", "appointed"]):
+    # Layer 3: Wikipedia fallback for historical/political claims
+    if not evidence and any(keyword in claim.lower() for keyword in ["elected", "sworn", "appointed"]):
         try:
             wp_summary = wikipedia.summary(claim.split(" in ")[0], sentences=3)
             evidence.append(f"📚 Wikipedia: {wp_summary}")
-        except:
-            pass
+        except Exception as e:
+            print(f"Wikipedia Error: {str(e)}")
 
-    return "\n\n".join(evidence) if evidence else "No reliable sources found"
+    return "\n\n".join(evidence) if evidence else "No reliable sources found automatically"
+
+
 
 # ===== MODEL PROCESSING =====
 def generate_verdict(claim: str, evidence: str) -> dict:
