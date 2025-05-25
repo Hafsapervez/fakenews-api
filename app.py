@@ -25,7 +25,9 @@ app.add_middleware(
 
 # ===== SERVICES SETUP =====
 HF_TOKEN = os.getenv("HF_TOKEN")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
+GOOGLE_API_KEY ="AIzaSyDVL1OZzaQPsbLKznX5N1TWZo7iX1ewtrY"
+GOOGLE_CSE_ID = "93b82db52b93044b9"
+NEWSAPI_KEY = "pub_b83c11afa1944d06b8d52dcf82298ccc"
 
 if not HF_TOKEN or not NEWSAPI_KEY:
     raise ValueError("Missing required environment variables")
