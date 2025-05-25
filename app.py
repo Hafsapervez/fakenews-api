@@ -1,5 +1,5 @@
 # ===== INSTALLATIONS =====
-!pip install fastapi uvicorn transformers accelerate bitsandbytes pyngrok google-api-python-client wikipedia python-dotenv newsapi-python
+# !pip install fastapi uvicorn transformers accelerate bitsandbytes pyngrok google-api-python-client wikipedia python-dotenv newsapi-python
 
 # ===== IMPORTS =====
 import os
