@@ -1,4 +1,3 @@
-# ===== IMPORTS ===== 
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -32,7 +31,7 @@ if not HF_TOKEN or not NEWSAPI_KEY:
     raise ValueError("Missing required environment variables")
 
 client = InferenceClient(token=HF_TOKEN, model="mistralai/Mistral-7B-Instruct-v0.3")
-newsapi = NewsApiClient(api_key=NEWSAPI_KEY, timeout=40)
+newsapi = NewsApiClient(api_key=NEWSAPI_KEY)  # Removed timeout parameter
 
 # ===== EVIDENCE GATHERING =====
 def fetch_evidence(claim: str) -> str:
