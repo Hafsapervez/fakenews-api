@@ -26,8 +26,8 @@ MAX_TOKENS = 150  # Reduced for Colab stability
 load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID= os.getenv("GOOGLE_CSE_ID")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY ")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 
 # Validate they exist
 if not HF_TOKEN:
