@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+transformers
+accelerate
+bitsandbytes
+python-dotenv
+pyngrok
+google-api-python-client
+wikipedia
+newsapi-python
+nest_asyncio
+huggingface_hub
+torch
