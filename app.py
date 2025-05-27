@@ -113,12 +113,10 @@ def fetch_evidence(claim: str) -> str:
     return "\n\n".join(evidence) if evidence else "No reliable sources found automatically"
 
 
-
 # ===== MODEL PROCESSING =====
 def generate_verdict(claim: str, evidence: str) -> dict:
     """Get model analysis with proper prompt engineering"""
     if evidence == "No reliable sources found":
-        # Special handling when no evidence is found
         prompt = f"""<s>[INST] You are a professional fact-checker. Analyze the following claim without external evidence:
 Claim: {claim}
 
@@ -142,13 +140,27 @@ Provide structured response:
 4. Key Evidence: [Most relevant source]
 5. Latest Date: [YYYY-MM-DD or Unknown] [/INST]"""
 
-    response = client.text_generation(
-        prompt=prompt,
-        max_new_tokens=250,
-        temperature=0.7
-    )
+    try:
+        # First try standard text generation
+        response = client.text_generation(
+            prompt=prompt,
+            max_new_tokens=250,
+            temperature=0.7
+        )
+    except Exception as e:
+        if "not supported for task text-generation" in str(e):
+            # Fallback to conversational API
+            api_url = f"https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+            payload = {
+                "inputs": prompt,
+                "parameters": {"max_new_tokens": 250, "temperature": 0.7}
+            }
+            response = requests.post(api_url, headers=headers, json=payload).json()[0]['generated_text']
+        else:
+            raise HTTPException(status_code=500, detail=f"LLM Error: {str(e)}")
     
-    # Parse the response
+    # Parse the response (keep your existing parsing logic)
     lines = [l.strip() for l in response.split('\n') if l.strip()]
     result = {
         "verdict": "Unverifiable",
@@ -171,6 +183,62 @@ Provide structured response:
             result["latest_date"] = line.split(":")[1].strip()
     
     return result
+# def generate_verdict(claim: str, evidence: str) -> dict:
+#     """Get model analysis with proper prompt engineering"""
+#     if evidence == "No reliable sources found":
+#         # Special handling when no evidence is found
+#         prompt = f"""<s>[INST] You are a professional fact-checker. Analyze the following claim without external evidence:
+# Claim: {claim}
+
+# Provide structured response:
+# 1. Verdict: [True/False/Misleading/Unverifiable]
+# 2. Confidence: [High/Medium/Low]
+# 3. Summary: [Concise analysis based on your knowledge]
+# 4. Key Evidence: [None]
+# 5. Latest Date: [Unknown] [/INST]"""
+#     else:
+#         prompt = f"""<s>[INST] You are a professional fact-checker. Analyze:
+# Claim: {claim}
+
+# Evidence:
+# {evidence}
+
+# Provide structured response:
+# 1. Verdict: [True/False/Misleading/Unverifiable]
+# 2. Confidence: [High/Medium/Low]
+# 3. Summary: [Concise analysis]
+# 4. Key Evidence: [Most relevant source]
+# 5. Latest Date: [YYYY-MM-DD or Unknown] [/INST]"""
+
+#     response = client.text_generation(
+#         prompt=prompt,
+#         max_new_tokens=250,
+#         temperature=0.7
+#     )
+    
+#     # Parse the response
+#     lines = [l.strip() for l in response.split('\n') if l.strip()]
+#     result = {
+#         "verdict": "Unverifiable",
+#         "confidence": "Low",
+#         "summary": "Insufficient evidence to verify the claim",
+#         "key_evidence": "",
+#         "latest_date": "Unknown"
+#     }
+    
+#     for line in lines:
+#         if "Verdict:" in line:
+#             result["verdict"] = line.split(":")[1].strip()
+#         elif "Confidence:" in line:
+#             result["confidence"] = line.split(":")[1].strip()
+#         elif "Summary:" in line:
+#             result["summary"] = line.split(":")[1].strip()
+#         elif "Key Evidence:" in line:
+#             result["key_evidence"] = line.split(":")[1].strip()
+#         elif "Latest Date:" in line:
+#             result["latest_date"] = line.split(":")[1].strip()
+    
+#     return result
 
 # ===== API ENDPOINTS =====
 class ClaimRequest(BaseModel):
